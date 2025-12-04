@@ -3,6 +3,8 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional
+import multiprocessing as mp
+import queue as queue_mod
 
 from mouse_oscillator import MouseJitter, load_config
 
@@ -16,6 +18,8 @@ class App:
         self.jitter: Optional[MouseJitter] = None
         self.enabled = False
         self._bound_key: Optional[str] = None
+        self.kb_proc: Optional[mp.Process] = None
+        self.kb_queue: Optional[mp.Queue] = None
         self.var_amplitude = tk.IntVar(value=int(self.cfg.get("amplitude_pixels", 12)))
         self.var_frequency = tk.DoubleVar(value=float(self.cfg.get("frequency_hz", 20)))
         self.var_key = tk.StringVar(value=str(self.cfg.get("trigger_key", "x")))
@@ -67,15 +71,15 @@ class App:
         if self.jitter is not None:
             self.jitter.stop()
         self.jitter = MouseJitter(amp, freq, key, tog)
-        # Bind Tk key events (window-focused). Avoids macOS event-tap crash.
-        self._rebind_keys(key)
+        # Start global key listener in a separate process to avoid Tk/event-tap conflict
+        self._start_global_listener(key)
         self.enabled = True
-        self.status_var.set(f"armed: hold '{key}' in window to jitter")
+        self.status_var.set(f"armed: hold '{key}' anywhere to jitter")
 
     def on_stop(self):
         if self.jitter is not None:
             self.jitter.stop()
-        self._unbind_keys()
+        self._stop_global_listener()
         self.enabled = False
         self.status_var.set("stopped")
 
@@ -86,8 +90,8 @@ class App:
             self.jitter.stop()
         self.jitter = MouseJitter(amp, freq, key, tog)
         if self.enabled:
-            self._rebind_keys(key)
-            self.status_var.set(f"armed: hold '{key}' in window to jitter")
+            self._start_global_listener(key)
+            self.status_var.set(f"armed: hold '{key}' anywhere to jitter")
         else:
             self.status_var.set("idle")
 
@@ -114,37 +118,73 @@ class App:
     def on_close(self):
         if self.jitter is not None:
             self.jitter.stop()
-        self._unbind_keys()
+        self._stop_global_listener()
         self.root.destroy()
 
-    def _rebind_keys(self, key: str):
-        self._unbind_keys()
-        self._bound_key = key
-        self.root.bind(f"<KeyPress-{key}>", self._on_key_press)
-        self.root.bind(f"<KeyRelease-{key}>", self._on_key_release)
+    def _start_global_listener(self, key: str):
+        self._stop_global_listener()
+        self.kb_queue = mp.Queue()
+        try:
+            self.kb_proc = mp.Process(target=kb_child, args=(key.lower(), self.kb_queue), daemon=True)
+            self.kb_proc.start()
+            self.root.after(20, self._poll_keyboard_queue)
+        except Exception as e:
+            self.kb_proc = None
+            self.kb_queue = None
+            messagebox.showerror(
+                "Permission Required",
+                "启动全局快捷键监听失败：请在系统设置→隐私与安全→输入监控中为 Terminal/IDE 或 Python 授权。\n\n错误：" + str(e),
+            )
 
-    def _unbind_keys(self):
-        if self._bound_key:
+    def _stop_global_listener(self):
+        if self.kb_proc is not None:
             try:
-                self.root.unbind(f"<KeyPress-{self._bound_key}>")
-                self.root.unbind(f"<KeyRelease-{self._bound_key}>")
+                self.kb_proc.terminate()
             except Exception:
                 pass
-        self._bound_key = None
+        self.kb_proc = None
+        self.kb_queue = None
 
-    def _on_key_press(self, event):
-        if not self.enabled or self.jitter is None:
+    def _poll_keyboard_queue(self):
+        if self.kb_queue is None:
             return
-        if self.jitter.toggle_mode:
-            self.jitter.toggle()
-        else:
-            self.jitter.start()
+        try:
+            while True:
+                ev = self.kb_queue.get_nowait()
+                if ev == "press":
+                    if self.jitter and self.enabled:
+                        if self.jitter.toggle_mode:
+                            self.jitter.toggle()
+                        else:
+                            self.jitter.start()
+                elif ev == "release":
+                    if self.jitter and self.enabled and not self.jitter.toggle_mode:
+                        self.jitter.stop()
+        except queue_mod.Empty:
+            pass
+        if self.enabled:
+            self.root.after(20, self._poll_keyboard_queue)
 
-    def _on_key_release(self, event):
-        if not self.enabled or self.jitter is None:
-            return
-        if not self.jitter.toggle_mode:
-            self.jitter.stop()
+
+def kb_child(key_char: str, q: mp.Queue):
+    from pynput.keyboard import Listener, KeyCode
+
+    def _match(k):
+        try:
+            return isinstance(k, KeyCode) and k.char is not None and k.char.lower() == key_char
+        except Exception:
+            return False
+
+    def on_press(k):
+        if _match(k):
+            q.put("press")
+
+    def on_release(k):
+        if _match(k):
+            q.put("release")
+
+    with Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
 
 
 def main():
