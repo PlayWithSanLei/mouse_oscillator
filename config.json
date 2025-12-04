@@ -1,6 +1,6 @@
 {
-  "amplitude_pixels": 12,
-  "frequency_hz": 10,
-  "trigger_key": "x",
+  "amplitude_pixels": 50,
+  "frequency_hz": 50.0,
+  "trigger_key": "z",
   "toggle_mode": false
 }
